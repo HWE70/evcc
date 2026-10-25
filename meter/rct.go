@@ -26,7 +26,8 @@ type RCT struct {
 	externalPower bool            // whether to query external power
 
 	mu           sync.Mutex
-	rSocStrategy *uint8 // remembers overwritten soc strategy value
+	rSocStrategy *uint8                       // remembers overwritten soc strategy value
+	lastWrite    map[rct.Identifier]time.Time // when this meter last wrote a register
 }
 
 // takeRSocStrategy atomically returns and clears the saved soc strategy, or nil
@@ -207,29 +208,29 @@ func NewRCT(ctx context.Context, uri, usage string, batterySocLimits batterySocL
 			case api.BatteryNormal:
 				if strategy := m.takeRSocStrategy(); strategy != nil {
 					eg.Go(func() error {
-						return m.conn.Write(rct.PowerMngSocStrategy, []byte{*strategy})
+						return m.writeByte(rct.PowerMngSocStrategy, *strategy)
 					})
 				}
 
 				eg.Go(func() error {
-					return m.conn.Write(rct.BatterySoCTargetMin, floatVal(batterySocLimits.MinSoc/100))
+					return m.writeFloat(rct.BatterySoCTargetMin, batterySocLimits.MinSoc/100, rctSocEpsilon)
 				})
 
 				eg.Go(func() error {
-					return m.conn.Write(rct.PowerMngSocMax, floatVal(batterySocLimits.MaxSoc/100))
+					return m.writeFloat(rct.PowerMngSocMax, batterySocLimits.MaxSoc/100, rctSocEpsilon)
 				})
 
 				eg.Go(func() error {
-					return m.conn.Write(rct.PowerMngBatteryPowerExternW, floatVal(0))
+					return m.writeFloat(rct.PowerMngBatteryPowerExternW, 0, rctPowerEpsilon)
 				})
 
 			case api.BatteryHold:
 				eg.Go(func() error {
-					return m.conn.Write(rct.PowerMngSocStrategy, []byte{rct.SOCTargetInternal})
+					return m.writeByte(rct.PowerMngSocStrategy, rct.SOCTargetInternal)
 				})
 
 				eg.Go(func() error {
-					return m.conn.Write(rct.PowerMngSocMax, floatVal(batterySocLimits.MaxSoc/100))
+					return m.writeFloat(rct.PowerMngSocMax, batterySocLimits.MaxSoc/100, rctSocEpsilon)
 				})
 
 				eg.Go(func() error {
@@ -239,42 +240,42 @@ func NewRCT(ctx context.Context, uri, usage string, batterySocLimits batterySocL
 					if err != nil {
 						return err
 					}
-					return m.conn.Write(rct.BatterySoCTargetMin, floatVal(soc))
+					return m.writeFloat(rct.BatterySoCTargetMin, soc, rctSocEpsilon)
 				})
 
 			case api.BatteryCharge:
 				eg.Go(func() error {
-					return m.conn.Write(rct.PowerMngUseGridPowerEnable, []byte{1})
+					return m.writeByte(rct.PowerMngUseGridPowerEnable, 1)
 				})
 
 				eg.Go(func() error {
-					return m.conn.Write(rct.PowerMngBatteryPowerExternW, floatVal(-batteryPowerLimits.MaxChargePower))
+					return m.writeFloat(rct.PowerMngBatteryPowerExternW, -batteryPowerLimits.MaxChargePower, rctPowerEpsilon)
 				})
 
 				eg.Go(func() error {
-					return m.conn.Write(rct.PowerMngSocStrategy, []byte{rct.SOCTargetExternal})
+					return m.writeByte(rct.PowerMngSocStrategy, rct.SOCTargetExternal)
 				})
 
 			case api.BatteryHoldCharge:
 				eg.Go(func() error {
-					return m.conn.Write(rct.PowerMngSocStrategy, []byte{rct.SOCTargetInternal})
+					return m.writeByte(rct.PowerMngSocStrategy, rct.SOCTargetInternal)
 				})
 
 				eg.Go(func() error {
-					return m.conn.Write(rct.BatterySoCTargetMin, floatVal(batterySocLimits.MinSoc/100))
+					return m.writeFloat(rct.BatterySoCTargetMin, batterySocLimits.MinSoc/100, rctSocEpsilon)
 				})
 
 				eg.Go(func() error {
-					return m.conn.Write(rct.PowerMngSocMax, floatVal(batterySocLimits.MinSoc/100))
+					return m.writeFloat(rct.PowerMngSocMax, batterySocLimits.MinSoc/100, rctSocEpsilon)
 				})
 
 			case api.BatteryDischarge:
 				eg.Go(func() error {
-					return m.conn.Write(rct.PowerMngBatteryPowerExternW, floatVal(batteryPowerLimits.MaxDischargePower))
+					return m.writeFloat(rct.PowerMngBatteryPowerExternW, batteryPowerLimits.MaxDischargePower, rctPowerEpsilon)
 				})
 
 				eg.Go(func() error {
-					return m.conn.Write(rct.PowerMngSocStrategy, []byte{rct.SOCTargetExternal})
+					return m.writeByte(rct.PowerMngSocStrategy, rct.SOCTargetExternal)
 				})
 
 			default:
@@ -393,6 +394,89 @@ func (m *RCT) returnEnergy() (float64, error) {
 	default:
 		return 0, fmt.Errorf("invalid usage: %s", m.usage)
 	}
+}
+
+// rctSocEpsilon is the tolerance for comparing a soc fraction (0 ... 1) read
+// back from the inverter. The float32 round-trip does not reproduce a written
+// value exactly (see curtailed above), and this is two orders of magnitude
+// below the one percent the RCT app itself offers.
+const rctSocEpsilon = 1e-4
+
+// rctPowerEpsilon is the tolerance in W for a power setpoint read back.
+const rctPowerEpsilon = 0.5
+
+// noteWrite records when a register was last written by this meter.
+func (m *RCT) noteWrite(id rct.Identifier) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.lastWrite == nil {
+		m.lastWrite = make(map[rct.Identifier]time.Time)
+	}
+	m.lastWrite[id] = time.Now()
+}
+
+// lastWriteAt returns when this meter last wrote id, or the zero time.
+func (m *RCT) lastWriteAt(id rct.Identifier) time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastWrite[id]
+}
+
+// writeSkippable reports whether a write can be skipped because the inverter
+// already holds the value.
+//
+// Three things must hold: the readback succeeded, it matches within epsilon,
+// and it is newer than the last write this meter made to the register.
+// Connection.Query serves reads from a cache for the configured cache duration
+// and a write does not invalidate that entry, so an entry read before our own
+// write still carries the value from before it -- skipping on that would leave
+// the register at whatever the earlier write put there.
+func writeSkippable(cur float64, err error, readAt, lastWrite time.Time, val, epsilon float64) bool {
+	return err == nil && readAt.After(lastWrite) && math.Abs(cur-val) <= epsilon
+}
+
+// writeFloat writes val to id unless the inverter already holds that value.
+//
+// Battery modes are regularly applied with values the inverter already has:
+// BatteryNormal rewrites the configured min and max soc every time a hold
+// ends, and those only change when the configuration does. Each write is
+// stored by the inverter and is one more chance for a write to fail or to be
+// answered late, which can leave a mode half applied (evcc-io/evcc#34779), so
+// writes that cannot change anything are not worth making.
+func (m *RCT) writeFloat(id rct.Identifier, val, epsilon float64) error {
+	cur, err := m.queryFloat(id)
+	_, readAt := m.conn.Get(id)
+
+	if writeSkippable(cur, err, readAt, m.lastWriteAt(id), val, epsilon) {
+		return nil
+	}
+
+	if err := m.conn.Write(id, floatVal(val)); err != nil {
+		return err
+	}
+
+	m.noteWrite(id)
+
+	return nil
+}
+
+// writeByte is writeFloat for a single-byte enum or bool register.
+func (m *RCT) writeByte(id rct.Identifier, val uint8) error {
+	cur, err := m.queryUint8(id)
+	_, readAt := m.conn.Get(id)
+
+	if writeSkippable(float64(cur), err, readAt, m.lastWriteAt(id), float64(val), 0) {
+		return nil
+	}
+
+	if err := m.conn.Write(id, []byte{val}); err != nil {
+		return err
+	}
+
+	m.noteWrite(id)
+
+	return nil
 }
 
 func floatVal(f float64) []byte {
